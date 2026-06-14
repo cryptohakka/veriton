@@ -1,0 +1,11 @@
+# deps
+node_modules/
+# env(秘密鍵・APIキー。Circle の .env.example は別途コミット)
+.env
+.env.local
+# foundry
+out/
+cache/
+# misc
+.DS_Store
+*.log
