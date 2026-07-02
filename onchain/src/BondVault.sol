@@ -58,6 +58,7 @@ contract BondVault {
     address public protocol;            // 運営側受取(v1)。v2 で分散化。
 
     uint64  public constant CHALLENGE_WINDOW = 1 hours;   // optimistic 反証期間(デモ用に短め)
+    uint64  public constant UNBOND_DELAY     = 1 hours;   // 引出遅延 = 反証期間と同長(デモ用に短め)
     uint256 public constant CHALLENGER_STAKE = 1e6;       // 1 USDC(虚偽申立抑止)
 
     // slash 配分 60/20/20(Althemis 継承):被害補填 / 発見報酬 / protocol
@@ -69,9 +70,19 @@ contract BondVault {
     mapping(address => uint256) public lockedOf;        // provider => challenge 中のロック額
     mapping(bytes32 => Challenge) public challenges;    // challengeId => Challenge
 
+    // P1: 即時引出は「捏造→challenge 前に逃走」を許すため、2段階引出(request → delay → withdraw)。
+    //     delay 中も bondOf は無傷 = challenge 可能なまま。窓内に challenge が入れば lock が引出を止める。
+    mapping(address => uint256) public unbondingOf;     // provider => 引出予約額
+    mapping(address => uint64)  public unbondReadyAt;   // provider => 引出可能時刻
+
+    // P2: 1つの捏造出力は1回だけ slash 可能(v1 は victim==challenger 前提ゆえ 1出力1罰が正)。
+    //     これが無いと同一 outputHash への再 challenge で bond 全額をドレインできる。
+    mapping(bytes32 => bool) public fraudSettled;       // outputHash => slash 済み
+
     // ───────────────────────── イベント ─────────────────────────
 
     event BondDeposited(address indexed provider, uint256 amount);
+    event UnbondRequested(address indexed provider, uint256 amount, uint64 readyAt);
     event BondWithdrawn(address indexed provider, uint256 amount);
     event Challenged(bytes32 indexed id, address indexed provider, address indexed challenger, ClaimType claimType);
     event Defended(bytes32 indexed id, bytes32 counterHash);
@@ -91,10 +102,25 @@ contract BondVault {
         emit BondDeposited(msg.sender, amount);
     }
 
-    /// challenge 中ロック分は引き出せない(free = bond - locked)。
-    function withdrawBond(uint256 amount) external {
+    /// 引出予約。UNBOND_DELAY 経過後に withdrawBond 可能になる。
+    /// 再 request は予約額・時刻を上書き(タイマーはリセット)。
+    /// 予約中も bond は challenge 対象のまま(bondOf を減らさない)= 逃走窓ゼロ。
+    function requestUnbond(uint256 amount) external {
         uint256 free = bondOf[msg.sender] - lockedOf[msg.sender];
         require(amount <= free, "exceeds free bond");
+        unbondingOf[msg.sender]   = amount;
+        unbondReadyAt[msg.sender] = uint64(block.timestamp) + UNBOND_DELAY;
+        emit UnbondRequested(msg.sender, amount, unbondReadyAt[msg.sender]);
+    }
+
+    /// 予約済み・delay 経過後のみ引出可。challenge 中ロック分は引き出せない(free = bond - locked)。
+    /// delay 中に challenge → slash された場合、free 減少により引出額は自動的に目減りする。
+    function withdrawBond(uint256 amount) external {
+        require(amount <= unbondingOf[msg.sender], "exceeds unbonding");
+        require(block.timestamp >= unbondReadyAt[msg.sender], "unbond delay not elapsed");
+        uint256 free = bondOf[msg.sender] - lockedOf[msg.sender];
+        require(amount <= free, "exceeds free bond");
+        unbondingOf[msg.sender] -= amount;
         bondOf[msg.sender] -= amount;
         require(usdc.transfer(msg.sender, amount), "transfer failed");
         emit BondWithdrawn(msg.sender, amount);
@@ -117,6 +143,9 @@ contract BondVault {
         ClaimType claimType,
         bytes calldata evidence
     ) external returns (bytes32 id) {
+        // 0) 既に slash 確定済みの出力への再申立は不可(1出力1罰、ドレイン防止)
+        require(!fraudSettled[outputHash], "output already slashed");
+
         // 1) provider 署名検証 → この出力は確かに provider のもの(否認不可)
         require(_verifySig(provider, outputHash, sig), "bad signature");
 
@@ -201,6 +230,7 @@ contract BondVault {
         require(usdc.transfer(protocol, toProtocol), "protocol payout failed");
 
         c.status = Status.SlashConfirmed;
+        fraudSettled[c.outputHash] = true;   // P2: 同一出力への再 slash を封じる
         emit Slashed(id, c.provider, penalty);
     }
 

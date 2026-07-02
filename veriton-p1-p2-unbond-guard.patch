@@ -1,0 +1,222 @@
+diff --git a/README.md b/README.md
+index eb6b1d0..4cad55b 100644
+--- a/README.md
++++ b/README.md
+@@ -2,6 +2,8 @@
+ 
+ **Pay without praying.**
+ 
++> **Demo video:** _coming soon_ <!-- TODO: replace with link after recording -->
++
+ x402 lets agents pay each other per-request in USDC. But payment settles the moment the response arrives — before anyone knows whether the response is *true*. An agent that claims "I supplied your USDC to Aave" gets paid whether or not it did. Today's agentic economy runs on **pay-and-pray**.
+ 
+ Veriton adds the missing layer: sellers post a bond, sign their outputs, and get **slashed on-chain when a claim is provably fabricated**. No trusted oracle, no arbitration committee — only claims that anyone can re-verify deterministically.
+@@ -58,12 +60,38 @@ Explorer: https://testnet.arcscan.app/address/0x1A8D3bcD80c0acB45A28d05c7d612d0F
+ 
+ Penalty distribution is **60 / 20 / 20** — victim compensation / challenger reward / protocol. In v1 the victim and the challenger are assumed to be the same party (the buyer challenges on its own behalf), so `_slash` pays victim + challenger shares + stake refund to the challenger in one transfer; separating victim resolution is a v2 item and marked as such in the contract. False accusations cost the challenger their 1 USDC stake (forfeited to protocol on `_reject`).
+ 
++Two properties make the bond an actual deterrent rather than a decoration:
++
++- **Withdrawal is two-step.** `requestUnbond` → `UNBOND_DELAY` (1 h, demo-length) → `withdrawBond`. The bond stays challengeable for the full delay — `bondOf` is untouched until withdrawal — so "fabricate, then withdraw before anyone challenges" has a zero-length escape window: any challenge landing inside the delay locks the funds and a confirmed slash shrinks what can leave.
++- **One output, one slash.** A slashed `outputHash` cannot be re-challenged (`fraudSettled`). Without this, a single fabricated output could be replayed to drain the entire bond — correct only under v1's victim == challenger assumption, and revisited when victims are separated in v2.
++
+ ## What is real vs. staged — honest disclosure
+ 
+ - **Layer 1 — contracts and verification: real.** BondVault is deployed on Arc Testnet; every slash/reject above is an immutable on-chain transaction anyone can inspect or reproduce with `cast`.
+ - **Layer 2 — the demo economy: staged by the operator.** Seller, buyer, and challenger wallets are all operated by the author. Note the incentive direction: in the fraud demo **the operator slashes their own seller's bond** — the demo is adverse to its own operator.
+ - **Layer 3 — external participants: none yet.** No third party has posted a bond or filed a challenge. We state this rather than simulate traction.
+ 
++## Known limitations (v1)
++
++Stated here so nobody has to discover them the hard way:
++
++- **Fixed penalty and fixed stake.** The slash penalty is a flat 10 USDC and the challenger stake a flat 1 USDC. Proportional stakes ("10% of the payment") are structurally impossible in this design, not merely unimplemented: payments ride the x402 rail entirely off-chain, so the contract never observes a payment amount. Scaling deterrence to economic weight is what the tiered-bond roadmap item is for.
++- **`OFFCHAIN` defence is optimistic-only.** For source-existence and cited-value claims, any non-empty counter-evidence flips the challenge to rejection at `resolve`. v1 records the counter-evidence hash as a fixed point for off-chain re-verification by watchers; it does not adjudicate. Escalation (UMA-style) is v2. The on-chain rail for these claim types exists and is tested — what v1 lacks is teeth, and we say so.
++- **Current-state attestation can misfire.** `ONCHAIN` claims check present state. A seller who genuinely supplied and then withdrew would look fabricated. This is disclosed in the contract; Merkle receipt proofs over past transactions (a-1) are the v2 fix. It is accurate for the demo class — DeFi execution where the position is supposed to persist.
++- **An unreadable target counts as fabrication.** If the asserted target reverts on `staticcall` or returns nothing, the verdict is fabricated — there is no separate `Unverifiable` outcome. The stance: the provider signed the assertion, target included; signing an unreadable target is the provider's failure. A third verdict (stake returned, bond untouched) is a v2 refinement.
++- **Trustlessness proves the assertion holds, not that it means anything.** `staticcall` re-execution shows the *signed predicate* is true. It cannot show the predicate references the canonical contract — a seller could assert a balance on a look-alike token they deployed themselves. Buyers (or the buyer-side SDK, roadmap) must pin asserted targets to known addresses before paying.
++- **Parallel `OFFCHAIN` challenges on one output can each lock and slash within the window.** Only sequential re-slash is guarded. Under victim == challenger this over-punishes a real fraudster rather than harming honest parties; still, it is a sharp edge and v2 closes it together with victim separation.
++
++## Roadmap (v2)
++
++Ordered by how much they extend coverage **without** giving up the EVM-as-oracle property:
++
++1. **Conditional escrow lane.** Prediction-type claims ("state X will hold at deadline T") resolved by the same `staticcall` predicate at T — extends Veriton from facts to time-axis claims with zero new trust assumptions. Direct answer to the "deterministic claims are a narrow slice" critique.
++2. **Tiered bond rates + newcomer exposure cap.** Bond requirements ease as `rejected-challenge` count grows; new sellers face a payment cap for their first N outputs. Structural answer to bootstrap fraud (deposit big, lie once, exit).
++3. **Victim / challenger separation.** Bind the buyer to `outputHash` at purchase so third-party watchers can challenge while compensation still reaches the victim.
++4. **Merkle receipt proofs (a-1).** Past-transaction claims without current-state footprint.
++5. **zkTLS / TLS-notary for source-existence claims.** Extends ⓐⓑ beyond optimistic defence — deliberately last, because it is the first item that imports a trust assumption (the notary) into a system whose selling point is having none.
++
+ ## Repository layout
+ 
+ ```
+diff --git a/onchain/src/BondVault.sol b/onchain/src/BondVault.sol
+index a54925d..1fdc75e 100644
+--- a/onchain/src/BondVault.sol
++++ b/onchain/src/BondVault.sol
+@@ -58,6 +58,7 @@ contract BondVault {
+     address public protocol;            // 運営側受取(v1)。v2 で分散化。
+ 
+     uint64  public constant CHALLENGE_WINDOW = 1 hours;   // optimistic 反証期間(デモ用に短め)
++    uint64  public constant UNBOND_DELAY     = 1 hours;   // 引出遅延 = 反証期間と同長(デモ用に短め)
+     uint256 public constant CHALLENGER_STAKE = 1e6;       // 1 USDC(虚偽申立抑止)
+ 
+     // slash 配分 60/20/20(Althemis 継承):被害補填 / 発見報酬 / protocol
+@@ -69,9 +70,19 @@ contract BondVault {
+     mapping(address => uint256) public lockedOf;        // provider => challenge 中のロック額
+     mapping(bytes32 => Challenge) public challenges;    // challengeId => Challenge
+ 
++    // P1: 即時引出は「捏造→challenge 前に逃走」を許すため、2段階引出(request → delay → withdraw)。
++    //     delay 中も bondOf は無傷 = challenge 可能なまま。窓内に challenge が入れば lock が引出を止める。
++    mapping(address => uint256) public unbondingOf;     // provider => 引出予約額
++    mapping(address => uint64)  public unbondReadyAt;   // provider => 引出可能時刻
++
++    // P2: 1つの捏造出力は1回だけ slash 可能(v1 は victim==challenger 前提ゆえ 1出力1罰が正)。
++    //     これが無いと同一 outputHash への再 challenge で bond 全額をドレインできる。
++    mapping(bytes32 => bool) public fraudSettled;       // outputHash => slash 済み
++
+     // ───────────────────────── イベント ─────────────────────────
+ 
+     event BondDeposited(address indexed provider, uint256 amount);
++    event UnbondRequested(address indexed provider, uint256 amount, uint64 readyAt);
+     event BondWithdrawn(address indexed provider, uint256 amount);
+     event Challenged(bytes32 indexed id, address indexed provider, address indexed challenger, ClaimType claimType);
+     event Defended(bytes32 indexed id, bytes32 counterHash);
+@@ -91,10 +102,25 @@ contract BondVault {
+         emit BondDeposited(msg.sender, amount);
+     }
+ 
+-    /// challenge 中ロック分は引き出せない(free = bond - locked)。
++    /// 引出予約。UNBOND_DELAY 経過後に withdrawBond 可能になる。
++    /// 再 request は予約額・時刻を上書き(タイマーはリセット)。
++    /// 予約中も bond は challenge 対象のまま(bondOf を減らさない)= 逃走窓ゼロ。
++    function requestUnbond(uint256 amount) external {
++        uint256 free = bondOf[msg.sender] - lockedOf[msg.sender];
++        require(amount <= free, "exceeds free bond");
++        unbondingOf[msg.sender]   = amount;
++        unbondReadyAt[msg.sender] = uint64(block.timestamp) + UNBOND_DELAY;
++        emit UnbondRequested(msg.sender, amount, unbondReadyAt[msg.sender]);
++    }
++
++    /// 予約済み・delay 経過後のみ引出可。challenge 中ロック分は引き出せない(free = bond - locked)。
++    /// delay 中に challenge → slash された場合、free 減少により引出額は自動的に目減りする。
+     function withdrawBond(uint256 amount) external {
++        require(amount <= unbondingOf[msg.sender], "exceeds unbonding");
++        require(block.timestamp >= unbondReadyAt[msg.sender], "unbond delay not elapsed");
+         uint256 free = bondOf[msg.sender] - lockedOf[msg.sender];
+         require(amount <= free, "exceeds free bond");
++        unbondingOf[msg.sender] -= amount;
+         bondOf[msg.sender] -= amount;
+         require(usdc.transfer(msg.sender, amount), "transfer failed");
+         emit BondWithdrawn(msg.sender, amount);
+@@ -117,6 +143,9 @@ contract BondVault {
+         ClaimType claimType,
+         bytes calldata evidence
+     ) external returns (bytes32 id) {
++        // 0) 既に slash 確定済みの出力への再申立は不可(1出力1罰、ドレイン防止)
++        require(!fraudSettled[outputHash], "output already slashed");
++
+         // 1) provider 署名検証 → この出力は確かに provider のもの(否認不可)
+         require(_verifySig(provider, outputHash, sig), "bad signature");
+ 
+@@ -201,6 +230,7 @@ contract BondVault {
+         require(usdc.transfer(protocol, toProtocol), "protocol payout failed");
+ 
+         c.status = Status.SlashConfirmed;
++        fraudSettled[c.outputHash] = true;   // P2: 同一出力への再 slash を封じる
+         emit Slashed(id, c.provider, penalty);
+     }
+ 
+diff --git a/onchain/test/BondVaultUnbond.t.sol b/onchain/test/BondVaultUnbond.t.sol
+new file mode 100644
+index 0000000..cef4cda
+--- /dev/null
++++ b/onchain/test/BondVaultUnbond.t.sol
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: MIT
++pragma solidity ^0.8.24;
++
++import "forge-std/Test.sol";
++import {BondVault} from "../src/BondVault.sol";
++import {BondVaultTest} from "./BondVault.t.sol";
++
++/// P1(2段階引出)/ P2(1出力1罰)のテスト群。
++/// BondVaultTest を継承し setUp / _buildClaim を再利用する。
++contract BondVaultUnbondTest is BondVaultTest {
++    // ───────────── P1: unbonding delay ─────────────
++
++    /// 予約なしの直接引出は不可(旧・即時 withdraw の廃止を担保)。
++    function test_Withdraw_WithoutRequest_Reverts() public {
++        vm.prank(provider);
++        vm.expectRevert("exceeds unbonding");
++        vault.withdrawBond(10e6);
++    }
++
++    /// 予約後でも delay 経過前は引出不可。
++    function test_Withdraw_BeforeDelay_Reverts() public {
++        vm.startPrank(provider);
++        vault.requestUnbond(10e6);
++        vm.expectRevert("unbond delay not elapsed");
++        vault.withdrawBond(10e6);
++        vm.stopPrank();
++    }
++
++    /// 予約 → delay 経過 → 引出成功。
++    function test_Withdraw_AfterDelay_Succeeds() public {
++        vm.startPrank(provider);
++        vault.requestUnbond(10e6);
++        vm.warp(block.timestamp + vault.UNBOND_DELAY());
++        uint256 before = usdc.balanceOf(provider);
++        vault.withdrawBond(10e6);
++        vm.stopPrank();
++
++        assertEq(vault.bondOf(provider), 90e6, "bond should decrease");
++        assertEq(usdc.balanceOf(provider), before + 10e6, "provider should receive funds");
++        assertEq(vault.unbondingOf(provider), 0, "reservation should be consumed");
++    }
++
++    /// 攻撃シナリオ本体:捏造 → 即 requestUnbond で逃走を試みる。
++    /// delay 窓内に challenge が着弾 → slash は成立し、引出は slash 後残高に切り詰められる。
++    function test_FraudThenUnbond_ChallengeStillSlashes() public {
++        (bytes memory evidence, bytes32 outputHash, bytes memory sig) = _buildClaim(50e6);
++        // aToken 残高 0 のまま = 捏造
++
++        // provider が全額引出を予約(逃走の試み)
++        vm.prank(provider);
++        vault.requestUnbond(100e6);
++
++        // delay 窓内に challenger が着弾 → 即 slash(bondOf は無傷だったので lock 可能)
++        vm.prank(challenger);
++        vault.challenge(provider, outputHash, sig, BondVault.ClaimType.ONCHAIN, evidence);
++        assertEq(vault.bondOf(provider), 90e6, "slash must land despite pending unbond");
++
++        // delay 経過後、予約 100e6 のうち引き出せるのは slash 後の free = 90e6 まで
++        vm.warp(block.timestamp + vault.UNBOND_DELAY());
++        vm.startPrank(provider);
++        vm.expectRevert("exceeds free bond");
++        vault.withdrawBond(100e6);
++        vault.withdrawBond(90e6);   // 残額は引出可(誠実な残余資産の没収はしない)
++        vm.stopPrank();
++        assertEq(vault.bondOf(provider), 0, "remaining bond withdrawn");
++    }
++
++    // ───────────── P2: 1出力1罰 ─────────────
++
++    /// slash 確定済みの outputHash への再 challenge は入口で弾かれる。
++    /// これが無いと 1 つの捏造で bond 全額をドレインできてしまう。
++    function test_Rechallenge_AfterSlash_Reverts() public {
++        (bytes memory evidence, bytes32 outputHash, bytes memory sig) = _buildClaim(50e6);
++
++        vm.prank(challenger);
++        vault.challenge(provider, outputHash, sig, BondVault.ClaimType.ONCHAIN, evidence);
++        assertEq(vault.bondOf(provider), 90e6, "first slash lands");
++
++        // 2発目の stake 原資を補充して再申立 → 入口 revert
++        usdc.mint(challenger, 1e6);
++        vm.prank(challenger);
++        vm.expectRevert("output already slashed");
++        vault.challenge(provider, outputHash, sig, BondVault.ClaimType.ONCHAIN, evidence);
++
++        assertEq(vault.bondOf(provider), 90e6, "no double slash");
++    }
++}
