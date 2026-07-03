@@ -9,7 +9,7 @@
  * Read-only throughout: no wallet, no gas, no writes.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   parseEnvelope,
   verifyEnvelope,
@@ -20,6 +20,10 @@ import {
   type VerificationReport,
   type StepResult,
 } from "@/lib/veriton-verify";
+import {
+  encodeEnvelopeParam,
+  decodeEnvelopeParam,
+} from "@/lib/envelope-permalink";
 import { DEMO_ENVELOPE, DEMO_ENVELOPE_READY } from "@/lib/demo-envelope";
 
 // ───────────────────────── verdict presentation ─────────────────────────
@@ -65,6 +69,27 @@ export default function VerifyPage() {
   const [report, setReport] = useState<VerificationReport | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  // /verify?e=<base64url(envelope)> — a permalink carries the envelope in
+  // the URL itself (no server lookup), so opening one fills the panel and
+  // runs the same read-only checks immediately. window.location is read in
+  // an effect (client-only), which keeps this page free of Suspense.
+  const autoRan = useRef(false);
+  useEffect(() => {
+    if (autoRan.current) return;
+    autoRan.current = true;
+    const param = new URLSearchParams(window.location.search).get("e");
+    if (!param) return;
+    const dec = decodeEnvelopeParam(param);
+    if (!dec.ok) {
+      setParseError(dec.error);
+      return;
+    }
+    setRaw(dec.json);
+    void run(dec.json);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const challengeCmd = useMemo(() => {
     if (!report || report.verdict !== "FABRICATED") return null;
@@ -158,12 +183,38 @@ export default function VerifyPage() {
                   Load live-evidence envelope
                 </button>
               )}
+              <button
+                onClick={async () => {
+                  const parsed = parseEnvelope(raw);
+                  if (!parsed.ok) {
+                    setParseError(parsed.error);
+                    return;
+                  }
+                  setParseError(null);
+                  const url = `${window.location.origin}/verify?e=${encodeEnvelopeParam(parsed.envelope)}`;
+                  try {
+                    await navigator.clipboard.writeText(url);
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 2000);
+                  } catch {
+                    // clipboard denied (non-secure context / permissions):
+                    // fall back to putting the URL where it can be copied.
+                    window.prompt("Copy this permalink:", url);
+                  }
+                }}
+                disabled={busy || raw.trim() === ""}
+                className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-700 transition-colors hover:border-slate-500 disabled:opacity-40"
+              >
+                {copied ? "Copied ✓" : "Copy permalink"}
+              </button>
             </div>
             <p className="mt-4 text-xs leading-relaxed text-slate-500">
               Envelopes come from any endpoint wrapped in{" "}
               <code className="font-mono">withVerifiedGateway</code>. The same
               bytes you verify here are the bytes a challenge submits — never
-              re-encode them.
+              re-encode them. Permalinks embed the full envelope in the URL —
+              no server, no database — so a link stays verifiable even if this
+              app disappears.
             </p>
           </section>
 
