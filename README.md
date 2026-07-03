@@ -8,6 +8,14 @@ x402 lets agents pay each other per-request in USDC. But payment settles the mom
 
 Veriton adds the missing layer: sellers post a bond, sign their outputs, and get **slashed on-chain when a claim is provably fabricated**. No trusted oracle, no arbitration committee — only claims that anyone can re-verify deterministically.
 
+## Who is this for
+
+- **Buyer agents** paying for claims they cannot cheaply re-verify per request — "I executed your DeFi order", "this source says X". Veriton turns "trust the seller" into "trust the chain state".
+- **Seller agents** who are actually honest and want that to be economically legible: a posted, challengeable bond is a signal no self-description can fake.
+- **Builders of agent marketplaces** who need an accountability layer that composes with x402 instead of replacing it — BondVault is permissionless and the envelope format is self-contained, so no marketplace-side integration is required to start.
+
+It is *not* for adjudicating quality, opinion, or honest error. Veriton draws that line on purpose (see below).
+
 ## Two layers, zero changes to the payment rail
 
 | Layer | What | Frequency |
@@ -16,6 +24,39 @@ Veriton adds the missing layer: sellers post a bond, sign their outputs, and get
 | **Collateral** | `BondVault.sol` on Arc — bond, challenge, slash | Only when fraud is alleged |
 
 The seller wraps its paid endpoint with `withVerifiedGateway` (a composition over Circle's `withGateway` — Circle code is vendored verbatim under Apache-2.0, untouched). Every paid response then carries a **signed, challengeable assertion**: the exact bytes that `BondVault._verifyOnchainClaim` will re-check via `staticcall` if anyone challenges.
+
+```mermaid
+sequenceDiagram
+    participant B as Buyer agent
+    participant S as Seller endpoint<br/>(withVerifiedGateway)
+    participant C as Circle Nanopayments<br/>(x402 rail, unmodified)
+    participant V as BondVault.sol<br/>(Arc Testnet)
+
+    Note over S,V: One-time setup: seller deposits bond (challengeable at all times)
+    S->>V: depositBond(10 USDC)
+
+    rect rgb(240, 248, 240)
+    Note over B,C: Happy path — BondVault is never touched, zero gas
+    B->>S: GET /premium/defi-execute
+    S-->>B: 402 Payment Required
+    B->>C: pay (sub-cent USDC, off-chain batching)
+    S-->>B: response + signed envelope<br/>(outputHash = keccak256(target, callData, op, expected), EIP-191 sig)
+    end
+
+    rect rgb(252, 240, 240)
+    Note over B,V: Only if fraud is alleged
+    B->>V: challenge(seller, outputHash, sig, evidence)
+    V->>V: verify sig ∧ hash binding
+    V->>V: staticcall(target, callData) — the EVM is the oracle
+    alt assertion holds
+        V-->>B: ChallengeRejected (stake forfeited, bond untouched)
+    else assertion contradicted
+        V-->>B: Slashed (10 USDC, same tx) + fraudSettled[outputHash]
+    end
+    end
+```
+
+The payment rail never learns about the bond; the bond contract never learns about the payment. The only coupling is the signed envelope the seller attaches to every paid response — and that coupling is one-directional and opt-in.
 
 ## What gets slashed — and what doesn't
 
@@ -27,6 +68,18 @@ Veriton slashes **deterministic fabrications only**:
 
 Quality, interpretation, and wrong-but-honest predictions are **never** slashed. That is the job of a reputation layer, not a penalty layer. Collapsing "lied" and "was wrong" into one score is how reputation systems get gamed; Veriton keeps them separate by construction.
 
+## How general is the verification?
+
+The primitive is deliberately narrow and deliberately generic: **any claim expressible as "`staticcall(target, callData)` returns a value in relation `op` to `expected`" is challengeable.** The demo asserts an aToken balance, but nothing in BondVault knows what Aave is — the same envelope format covers ERC-20 balances, oracle readings, registry entries, governance state, LP positions, or any view function on any contract.
+
+The honest boundary of that generality:
+
+- It covers **present on-chain state** (past-transaction claims need Merkle receipt proofs — roadmap ④).
+- It covers **what the predicate says, not what it means** — pinning `target` to a canonical address is the buyer's job (see Known Limitations).
+- Off-chain claims (ⓐ source-existence, ⓑ cited-value) ride the same challenge rail but resolve optimistically in v1.
+
+One primitive, one trust assumption (the EVM itself), an open-ended claim surface. The roadmap grows the surface without ever adding a second trust assumption until item ⑤ — which is exactly why it is last.
+
 ## Why no trusted oracle
 
 The assertion is bound before delivery:
@@ -36,6 +89,16 @@ outputHash == keccak256(abi.encode(target, callData, op, expected))
 ```
 
 The seller signs `outputHash` (EIP-191). A challenger submits the seller's own signed bytes — nothing else is accepted (`evidence mismatch` otherwise), so honest sellers cannot be framed with crafted predicates. The contract re-runs `staticcall(target, callData)` itself and compares. Anyone can reproduce the verdict; nobody has to be trusted.
+
+## Veriton as a protocol, not a platform
+
+Nothing in Veriton requires Veriton's permission or infrastructure:
+
+- **BondVault is permissionless.** Any seller can deposit a bond; any party can challenge. There is no allowlist, no operator role in the verdict path, no upgrade key over settled outcomes.
+- **The envelope is self-contained.** `(target, callData, op, expected, outputHash, signature)` is everything a verifier needs. The `/verify` panel is a convenience, not a dependency — the same verdict is reproducible with `cast` or a raw `eth_call`, gas-free, by anyone.
+- **The payment rail is untouched.** Sellers opt in by wrapping their endpoint; buyers opt in by checking envelopes. Neither side needs the other to have heard of Veriton for x402 itself to keep working.
+
+If the hosted app disappeared tomorrow, every bond, every settled verdict, and every envelope already issued would remain verifiable. That is the test we hold ourselves to.
 
 ## Live evidence (Arc Testnet)
 
@@ -63,6 +126,15 @@ Explorer: https://testnet.arcscan.app/address/0xb1e5fd74a816d2f3Bee521D9c6aa4241
 
 Penalty distribution is **60 / 20 / 20** — victim compensation / challenger reward / protocol. In v1 the victim and the challenger are assumed to be the same party (the buyer challenges on its own behalf), so `_slash` pays victim + challenger shares + stake refund to the challenger in one transfer; separating victim resolution is a v2 item and marked as such in the contract. False accusations cost the challenger their 1 USDC stake (forfeited to protocol on `_reject`).
 
+The bond is a **deterrence stake, not an escrow** — the same design class as PoS validator slashing. Honest operation consumes zero bond regardless of volume: a seller serving a million truthful responses posts the same 10 USDC as one serving ten. What the bond bounds is not throughput but *lying capacity*:
+
+```text
+compensation capacity = bondOf(seller) / PENALTY          (in v1: bond / 10 USDC)
+expected fraud value  < P(challenge) × PENALTY             (deterrence condition)
+```
+
+The first line is why buyers should read `bondOf` before paying: a seller with a 10 USDC bond can make exactly one fabrication whole. The second is why the fixed penalty is a real v1 limitation — when a single response is worth more than `P(challenge) × 10 USDC`, deterrence breaks, and no bond size fixes that without proportional stakes (structurally unavailable; see Known Limitations and roadmap ②).
+
 Two properties make the bond an actual deterrent rather than a decoration:
 
 - **Withdrawal is two-step.** `requestUnbond` → `UNBOND_DELAY` (1 h, demo-length) → `withdrawBond`. The bond stays challengeable for the full delay — `bondOf` is untouched until withdrawal — so "fabricate, then withdraw before anyone challenges" has a zero-length escape window: any challenge landing inside the delay locks the funds and a confirmed slash shrinks what can leave.
@@ -84,6 +156,7 @@ Stated here so nobody has to discover them the hard way:
 - **An unreadable target counts as fabrication.** If the asserted target reverts on `staticcall` or returns nothing, the verdict is fabricated — there is no separate `Unverifiable` outcome. The stance: the provider signed the assertion, target included; signing an unreadable target is the provider's failure. A third verdict (stake returned, bond untouched) is a v2 refinement.
 - **Trustlessness proves the assertion holds, not that it means anything.** `staticcall` re-execution shows the *signed predicate* is true. It cannot show the predicate references the canonical contract — a seller could assert a balance on a look-alike token they deployed themselves. Buyers (or the buyer-side SDK, roadmap) must pin asserted targets to known addresses before paying.
 - **Parallel `OFFCHAIN` challenges on one output can each lock and slash within the window.** Only sequential re-slash is guarded. Under victim == challenger this over-punishes a real fraudster rather than harming honest parties; still, it is a sharp edge and v2 closes it together with victim separation.
+- **Challenge gas is a griefing surface.** Every challenge — including ones destined for rejection — forces the contract to execute a seller-chosen-target `staticcall`, and the 1 USDC stake bounds the *economic* cost of frivolous challenges but not the *gas* cost of processing them. A hostile challenger cannot take a seller's bond, but can force the protocol to burn gas at 1 USDC per attempt. On Arc's fee regime this is a nuisance, not an attack; on an expensive chain the stake would need to scale with gas price.
 
 ## Roadmap (v2)
 
@@ -94,6 +167,26 @@ Ordered by how much they extend coverage **without** giving up the EVM-as-oracle
 3. **Victim / challenger separation.** Bind the buyer to `outputHash` at purchase so third-party watchers can challenge while compensation still reaches the victim.
 4. **Merkle receipt proofs (a-1).** Past-transaction claims without current-state footprint.
 5. **zkTLS / TLS-notary for source-existence claims.** Extends ⓐⓑ beyond optimistic defence — deliberately last, because it is the first item that imports a trust assumption (the notary) into a system whose selling point is having none.
+
+## Circle Product Feedback
+
+Veriton is built directly on Circle's Arc Nanopayments stack, so this section is written from the position of an integrator, not a spectator.
+
+**Why we chose it.** The x402 + Gateway batching model is the only payment primitive we found where per-request, sub-cent agent-to-agent payment is real rather than aspirational. Crucially for Veriton's thesis, the rail is *composable without modification*: `withVerifiedGateway` wraps `withGateway` as a pure function composition, and every Circle file is vendored verbatim under its Apache-2.0 header. A verification layer that required forking the payment rail would be a platform; because Circle's design let us avoid that, Veriton can be a protocol.
+
+**What worked well.**
+- The demo repo (`arc-nanopayments-demo`) is genuinely runnable — the 402 handshake, batching, and settlement all worked on Arc Testnet without undocumented steps.
+- Arc's fast finality makes the challenge → verdict loop feel synchronous: `Slashed` lands in the same transaction as `challenge`, which is what makes the live demo legible.
+- Native USDC as the gas-and-bond asset removes an entire class of demo friction (no faucet juggling across two tokens).
+
+**Where we hit friction.**
+- **The payment amount is invisible on-chain, by design — which caps what a collateral layer can promise.** Because x402 payments settle off-chain and batch through Gateway, no contract can observe how much a given response was paid. Proportional deterrence ("stake 10% of the payment") is therefore *structurally impossible*, not merely unimplemented — this is the direct cause of Veriton's fixed 10 USDC penalty (see Known Limitations) and the motivation for the tiered-bond roadmap item. It is the single most consequential constraint we inherited.
+- The boundary between what `withGateway` guarantees and what the integrator must re-check (e.g. replay semantics of a settled payment header) had to be established by reading vendored source rather than reference docs.
+
+**Suggestions.**
+1. **An optional, privacy-preserving payment attestation.** Even a coarse one — a signed digest binding `(payer, payee, amountBucket, requestHash)` that a contract could verify — would unlock proportional stakes and per-payment escrow for every project building accountability on top of x402, without putting per-request amounts on-chain in the clear.
+2. **A stable "integrator surface" doc for `withGateway`**: which invariants are guaranteed across versions, which are incidental. Composition-based extensions like ours depend on that contract being explicit.
+3. **First-class Arc Testnet state manipulation for demos** (e.g. documented `setBalance`-style cheatcodes or a faucet API): adversarial demos need to *stage fraud* reproducibly, and today that requires custom mock contracts.
 
 ## Repository layout
 
