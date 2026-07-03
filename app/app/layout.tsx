@@ -28,8 +28,9 @@ const defaultUrl = process.env.VERCEL_URL
 
 export const metadata: Metadata = {
   metadataBase: new URL(defaultUrl),
-  title: "Arc Nanopayments Demo",
-  description: "Arc nanopayments demo application",
+  title: "Veriton — the honesty layer for x402",
+  description:
+    "Bond-backed, on-chain verifiable claims for x402 machine payments. Verify a seller's signed envelope for free before trusting it.",
 };
 
 const geistSans = Geist({
