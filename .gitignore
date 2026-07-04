@@ -9,3 +9,6 @@ cache/
 # misc
 .DS_Store
 *.log
+app/scripts/
+scripts/
+tmp/
