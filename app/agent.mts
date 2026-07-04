@@ -10,6 +10,7 @@ import {
 import { arcTestnet } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import * as readline from "node:readline/promises";
+import { makeBondGate } from "./lib/bond-gate.ts";
 
 // --- Parse CLI args ---
 function parseArgs() {
@@ -77,7 +78,15 @@ const DEPOSIT_AMOUNT = process.env.DEPOSIT_AMOUNT ?? "1";
 // Amount of native USDC to send for gas (Arc testnet gas = USDC with 18 decimals)
 const GAS_FUND_AMOUNT = parseEther("0.01");
 
-const endpoints = [
+type Endpoint = {
+  url: string;
+  method: "GET" | "POST";
+  body?: unknown;
+  /** Veriton-verified endpoint: check the seller's free bond before paying. */
+  veriton?: { seller: `0x${string}` };
+};
+
+const endpoints: Endpoint[] = [
   { url: `${BASE_URL}/api/premium/quote`, method: "GET" as const },
   { url: `${BASE_URL}/api/premium/dataset`, method: "GET" as const },
   {
@@ -92,6 +101,27 @@ const endpoints = [
 const ephemeralKey = generatePrivateKey();
 const ephemeralAccount = privateKeyToAccount(ephemeralKey);
 console.log(`Ephemeral agent wallet: ${ephemeralAccount.address}`);
+
+// --- Veriton bond gate (buyer-side, reference implementation) ---
+// Before paying the Veriton-verified endpoint, read the seller's free bond
+// (bondOf - lockedOf) and refuse when fewer than VERITON_MIN_LIES_COVERED
+// fabrications are compensable. The threshold is the buyer's risk choice,
+// not the protocol's. RPC failure fails closed: no bond visible, no payment.
+const VERITON_SELLER = (process.env.VERITON_SELLER_ADDRESS ??
+  "0x774113cF25814bBF6fF35e2FA169B7Df57D33613") as `0x${string}`;
+const bondGate = makeBondGate({
+  seller: VERITON_SELLER,
+  minLiesCovered: BigInt(process.env.VERITON_MIN_LIES_COVERED ?? "1"),
+});
+endpoints.push({
+  url: `${BASE_URL}/api/premium/defi-execute`,
+  method: "POST",
+  // The buyer asks the seller to supply on its behalf; the seller's signed
+  // assertion is then "aToken.balanceOf(buyer) >= amount".
+  body: { wallet: ephemeralAccount.address, amount: "100" },
+  veriton: { seller: VERITON_SELLER },
+});
+console.log(`Veriton gate: seller ${VERITON_SELLER}, min lies covered ${process.env.VERITON_MIN_LIES_COVERED ?? "1"}`);
 
 // --- Fund the ephemeral wallet from the funder ---
 const funderAccount = privateKeyToAccount(funderKey);
@@ -253,6 +283,37 @@ async function handleLimitReached() {
   startPaymentLoop();
 }
 
+function payEndpoint(ep: Endpoint) {
+  inFlight++;
+  const start = Date.now();
+  gateway
+    .pay(ep.url, { method: ep.method, body: ep.body })
+    .then((result) => {
+      inFlight--;
+      const ms = Date.now() - start;
+      const amount = parseFloat(result.formattedAmount);
+      totalSpent += amount;
+
+      const limitInfo = spendingLimit !== null
+        ? ` [spent: ${totalSpent.toFixed(6)}/${spendingLimit.toFixed(6)} USDC]`
+        : "";
+      console.log(
+        `#${index} ${ep.method} ${ep.url.split("/").pop()} -> ${result.formattedAmount} USDC (${ms}ms) [in-flight: ${inFlight}]${limitInfo}`,
+      );
+
+      if (spendingLimit !== null && totalSpent >= spendingLimit) {
+        handleLimitReached();
+      }
+    })
+    .catch((err) => {
+      inFlight--;
+      const ms = Date.now() - start;
+      console.error(
+        `#${index} ${ep.url.split("/").pop()} FAILED (${ms}ms): ${err.message} [in-flight: ${inFlight}]`,
+      );
+    });
+}
+
 function startPaymentLoop() {
   balanceInterval = setInterval(checkAndRedeposit, 30_000);
 
@@ -261,35 +322,20 @@ function startPaymentLoop() {
 
     const ep = endpoints[index % endpoints.length];
     index++;
-    inFlight++;
 
-    const start = Date.now();
-    gateway
-      .pay(ep.url, { method: ep.method, body: ep.body })
-      .then((result) => {
-        inFlight--;
-        const ms = Date.now() - start;
-        const amount = parseFloat(result.formattedAmount);
-        totalSpent += amount;
-
-        const limitInfo = spendingLimit !== null
-          ? ` [spent: ${totalSpent.toFixed(6)}/${spendingLimit.toFixed(6)} USDC]`
-          : "";
-        console.log(
-          `#${index} ${ep.method} ${ep.url.split("/").pop()} -> ${result.formattedAmount} USDC (${ms}ms) [in-flight: ${inFlight}]${limitInfo}`,
-        );
-
-        if (spendingLimit !== null && totalSpent >= spendingLimit) {
-          handleLimitReached();
-        }
-      })
-      .catch((err) => {
-        inFlight--;
-        const ms = Date.now() - start;
-        console.error(
-          `#${index} ${ep.url.split("/").pop()} FAILED (${ms}ms): ${err.message} [in-flight: ${inFlight}]`,
-        );
+    // Veriton-verified endpoint: gate on the seller's free bond first.
+    // The check is TTL-cached (one RPC round per window, not per payment);
+    // the gate's verdict is logged only when freshly read, so the loop
+    // stays legible at 1 req/s.
+    if (ep.veriton) {
+      void bondGate.check().then((gate) => {
+        if (!gate.fromCache) console.log(gate.logLine);
+        if (gate.ok) payEndpoint(ep);
       });
+      return;
+    }
+
+    payEndpoint(ep);
   }, 1000);
 }
 

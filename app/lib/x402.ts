@@ -46,7 +46,7 @@ function buildPaymentRequirements(price: string) {
     asset: ARC_TESTNET_USDC,
     amount: amount.toString(),
     payTo: sellerAddress,
-    maxTimeoutSeconds: 345600,
+    maxTimeoutSeconds: 7 * 24 * 60 * 60 + 100, // Gateway facilitatorの最低要求(7日)+バッファ。旧: 345600(4日)で authorization_validity_too_short
     extra: {
       name: "GatewayWalletBatched",
       version: "1",
@@ -108,6 +108,9 @@ export function withGateway(
       );
 
       if (!verifyResult.isValid) {
+        console.error(
+          `[x402] Verification failed for ${endpoint}: ${verifyResult.invalidReason}`,
+        );
         return NextResponse.json(
           {
             error: "Payment verification failed",
