@@ -11,7 +11,7 @@
  * test can exercise the exact code the page ships.
  */
 
-import { parseEnvelope, type Envelope } from "./veriton-verify";
+import { parseEnvelope, type Envelope } from "./veriton-verify.ts";
 
 // ───────────────────────── base64url primitives ─────────────────────────
 
