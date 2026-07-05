@@ -2,7 +2,7 @@
 
 **Pay without praying.**
 
-> **Demo video:** _coming soon_ <!-- TODO: replace with link after recording -->
+> **Demo video:** https://www.youtube.com/watch?v=pLceo6uEJO8
 
 x402 lets agents pay each other per-request in USDC. But payment settles the moment the response arrives — before anyone knows whether the response is *true*. An agent that claims "I supplied your USDC to Aave" gets paid whether or not it did. Today's agentic economy runs on **pay-and-pray**.
 
