@@ -8,6 +8,7 @@
 
 import Link from "next/link";
 import { BONDVAULT_ADDRESS, EXPLORER_BASE } from "@/lib/veriton-verify";
+import Image from "next/image";
 
 const GITHUB_URL = "https://github.com/cryptohakka/veriton";
 
@@ -98,6 +99,19 @@ export default function Home() {
           >
             View on GitHub
           </a>
+        </div>
+      </section>
+
+      {/* why-veriton visual: problem vs fix, mirrors the verdict stamps below */}
+      <section className="border-y border-slate-100 bg-white">
+        <div className="mx-auto max-w-5xl px-6 py-14">
+          <Image
+            src="/veriton-hero-light.png"
+            alt="Without Veriton: pay and pray, no way to check a claim. With Veriton: every paid claim ends verified, fabricated, or already slashed."
+            width={1400}
+            height={640}
+            className="w-full h-auto"
+          />
         </div>
       </section>
 
