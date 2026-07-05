@@ -14,6 +14,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { toJsonSafe } from "@/lib/json-bigint";
 import { encodeFunctionData, parseAbi, type Hex } from "viem";
 import {
   withVerifiedGateway,
@@ -62,7 +63,7 @@ const handler = async (req: NextRequest) => {
   // The human-facing deliverable, in Veriton's standard form.
   const output = `AAVE_SUPPLY_USDC=${amountUsdc};wallet=${wallet};status=executed`;
 
-  return NextResponse.json({ output, assertion });
+  return NextResponse.json(toJsonSafe({ output, assertion }));
 };
 
 export const POST = withVerifiedGateway(

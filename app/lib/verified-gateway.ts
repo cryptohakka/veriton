@@ -20,6 +20,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { withGateway } from "./x402"; // Circle, Apache-2.0, vendored verbatim
+import { toJsonSafe } from "./json-bigint";
 
 // Mirrors BondVault.sol  enum Op { GTE, LTE, EQ, GT, LT, NEQ }
 export enum Op {
@@ -119,7 +120,7 @@ function verifyAndSign(
     const headers = new Headers(response.headers);
     headers.delete("content-length"); // body size changed
     return NextResponse.json(
-      {
+      toJsonSafe({
         ...body,
         verification: {
           outputHash,
@@ -128,7 +129,7 @@ function verifyAndSign(
           signer: account.address,
           assertion, // human-readable redundant copy (optional)
         },
-      },
+      }),
       { status: response.status, headers },
     );
   };
