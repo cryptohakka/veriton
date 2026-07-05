@@ -18,7 +18,7 @@
  * a verdict must not be invented, but a payment can always wait.
  */
 
-import { makeClient, BONDVAULT_ADDRESS, formatUsdc } from "./veriton-verify";
+import { makeClient, BONDVAULT_ADDRESS, formatUsdc } from "./veriton-verify.ts";
 import { parseAbi, type Address } from "viem";
 
 /** Mirrors BondVault._penaltyFor (flat 10 USDC in the current deployment). */
