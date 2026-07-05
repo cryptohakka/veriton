@@ -132,7 +132,7 @@ export default function Home() {
             With Veriton, the reply carries a signed, checkable claim. Your
             agent confirms it against live chain state in one free call
             before it ever trusts the output. If the executor lied, one
-            transaction slashes its bond — and 60% of it comes to you.
+            transaction slashes its bond — and 80% of it comes to you.
           </p>
         </div>
       </section>
