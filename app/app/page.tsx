@@ -105,7 +105,7 @@ export default function Home() {
       {/* why-veriton visual: problem vs fix, mirrors the verdict stamps below */}
       <section className="border-y border-slate-100 bg-white">
         <div className="mx-auto max-w-5xl px-6 py-14">
-          <Image
+          <img
             src="/veriton-hero-light.png"
             alt="Without Veriton: pay and pray, no way to check a claim. With Veriton: every paid claim ends verified, fabricated, or already slashed."
             width={1400}
