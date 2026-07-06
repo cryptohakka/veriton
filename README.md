@@ -194,7 +194,7 @@ Veriton is built directly on Circle's Arc Nanopayments stack, so this section is
 ## Repository layout
 
 ```
-onchain/   Foundry — BondVault.sol, tests (forge test)
+onchain/   Foundry — BondVault.sol, tests (forge test — 19/19 passing)
 app/       Next.js seller + agent (based on Circle's arc-nanopayments-demo)
   lib/verified-gateway.ts        Veriton wrapper (MIT) over Circle's withGateway (Apache-2.0)
   app/api/premium/defi-execute/  Veriton demo endpoint: paid DeFi execution + signed assertion
